@@ -37,7 +37,9 @@ contract CounselixRegistry is AccessControl {
 
     event CategoryAdded(uint32 indexed categoryId, string name);
     event CategoryStatusChanged(uint32 indexed categoryId, bool active);
-    event AgentRegistered(uint256 indexed agentId, bytes32 indexed hotkey, uint32 indexed categoryId, string metadataURI);
+    event AgentRegistered(
+        uint256 indexed agentId, bytes32 indexed hotkey, uint32 indexed categoryId, string metadataURI
+    );
     event AgentMetadataUpdated(uint256 indexed agentId, string metadataURI);
     event AgentStatusChanged(uint256 indexed agentId, bool active);
 
@@ -117,6 +119,14 @@ contract CounselixRegistry is AccessControl {
 
     function agentExists(uint256 agentId) public view returns (bool) {
         return agentId != 0 && agentId <= agentCount;
+    }
+
+    /// @notice True if the agent exists, is active, and its category is active, i.e. users can select it
+    ///         as their Main AI Agent and pay for it.
+    function isAgentActive(uint256 agentId) external view returns (bool) {
+        if (!agentExists(agentId)) return false;
+        Agent storage a = _agents[agentId];
+        return a.active && _categories[a.categoryId].active;
     }
 
     // ------------------------------------------------------------------ internal

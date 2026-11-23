@@ -111,6 +111,21 @@ contract CounselixRegistryTest is Test {
         assertFalse(a.active);
     }
 
+    function test_IsAgentActive() public {
+        assertFalse(registry.isAgentActive(1));
+        uint32 cat = _education();
+        vm.startPrank(operator);
+        uint256 id = registry.registerAgent(HOTKEY, cat, "");
+        assertTrue(registry.isAgentActive(id));
+
+        registry.setCategoryActive(cat, false);
+        assertFalse(registry.isAgentActive(id));
+        registry.setCategoryActive(cat, true);
+        registry.setAgentActive(id, false);
+        assertFalse(registry.isAgentActive(id));
+        vm.stopPrank();
+    }
+
     function test_AgentExists() public {
         assertFalse(registry.agentExists(0));
         assertFalse(registry.agentExists(1));
