@@ -2,73 +2,106 @@
 
 Smart contracts for **Counselix**, a decentralized AI consulting marketplace built on a Bittensor subnet.
 
-Miners run AI consulting agents. Users subscribe to the platform and pick one agent as their **Main AI Agent**. These
-contracts record every subscription payment and the agent it is credited to, so that subnet validators can set miner
-weights from verifiable on-chain revenue.
+Miners run AI consulting agents. Users subscribe to an agent with **TAO** or **USDC**. These contracts move every
+payment straight to the treasury, record it publicly, and record the revenue each agent earns per day. Subnet
+validators then reward miners from this on-chain data.
 
 ```
-counselix-backend ──writes──▶ counselix-contracts ◀──reads── counselix-subnet (validators)
+                 ┌───────────── Bittensor EVM ─────────────┐        ┌──────── Base ────────┐
+user ──TAO──▶ CounselixTaoPayments ──▶ treasury             │        │                      │
+                 │  └─ records ─▶ CounselixLedger ◀──reads── validators ──checks──▶ CounselixUsdcPayments ◀──USDC── user
+                 │                  ▲      ▲                │        │        └──▶ treasury (Base)
+                 │   relays USDC ───┘      └─── daily revenue, heartbeat (counselix-backend)
+                 └─────────────────────────────────────────┘        └──────────────────────┘
 ```
 
 ## Contracts
 
-| Contract | Purpose |
+| Contract | Chain | Purpose |
+|---|---|---|
+| [`CounselixRegistry`](src/CounselixRegistry.sol) | Bittensor EVM | Consulting categories and the agents in each, keyed by miner hotkey |
+| [`CounselixLedger`](src/CounselixLedger.sol) | Bittensor EVM | Payments, daily revenue per agent, and platform service status |
+| [`CounselixTaoPayments`](src/CounselixTaoPayments.sol) | Bittensor EVM | TAO subscriptions: forwards TAO to the treasury and records the payment in one transaction |
+| [`UniswapV3TaoUsdOracle`](src/oracles/UniswapV3TaoUsdOracle.sol) | Bittensor EVM | TAO market price: 30-minute average of the WTAO/USDC Uniswap V3 pool |
+| [`CounselixUsdcPayments`](src/CounselixUsdcPayments.sol) | Base | USDC subscriptions: forwards native USDC to the treasury and emits the payment |
+
+## Payments
+
+Plans are **Monthly (30 days)** and **Annual (365 days)**. Every agent has the same price, which the admin sets in
+each payments contract. Prices are in micro-USD, so `20_000_000` is $20.00.
+
+**TAO (Bittensor EVM).** `CounselixTaoPayments.pay(paymentId, userId, agentId, plan)` does all of the following in
+**one transaction**:
+1. computes the TAO amount for the plan's USD price from the TAO market price (`quote(plan)` shows it in advance);
+2. sends exactly that amount to the treasury and returns any excess to the payer;
+3. records the payment in the Ledger with its fixed USD value and the TAO price used.
+
+The payment fails if the agent is not active.
+
+**USDC (Base).** Users approve the plan price, then call `CounselixUsdcPayments.pay(...)`. The USDC goes straight
+to the treasury on Base, and the contract emits `UsdcPaymentReceived`. The backend relays each payment to
+`CounselixLedger.recordBaseUsdcPayment` with the **Base transaction hash and log index**. Anyone, including
+validators, can check each relayed record against the event on Base.
+
+**Treasury.** The payments contracts never hold funds. Each forwards payments to a treasury address, which only
+the admin can change. The dev team manages the treasury manually; no contract controls how it is used.
+
+### TAO price
+
+[`UniswapV3TaoUsdOracle`](src/oracles/UniswapV3TaoUsdOracle.sol) reads the time-weighted average tick of the WTAO/USDC
+0.3% pool on Bittensor EVM over 30 minutes, and values 1 USDC at $1. Defaults used by the deploy script:
+
+| | Address |
 |---|---|
-| [`CounselixRegistry`](src/CounselixRegistry.sol) | Consulting categories (e.g. Education) and the agents offered in each, keyed by miner hotkey |
-| [`CounselixLedger`](src/CounselixLedger.sol) | Subscription payments and refunds, credited to agents and aggregated per epoch |
+| WTAO/USDC 0.3% pool | `0x6647dcbeb030dc8E227D8B1A2Cb6A49F3C887E3c` |
+| WTAO | `0x9Dc08C6e2BF0F1eeD1E00670f80Df39145529F81` |
+| USDC (bridged, in the pool) | `0xB833E8137FEDf80de7E908dc6fea43a029142F20` |
 
-## Revenue attribution: the Selected Agent model
+The pool's liquidity is small, so the admin can replace the oracle with `setOracle` when a deeper price source
+becomes available. The pool must keep enough observations to cover 30 minutes. If it does not, call
+`increaseObservationCardinalityNext` on the pool once.
 
-Each user selects one agent as their **Main AI Agent**. **100% of every subscription payment the user makes is
-credited to that agent**, and so to the miner whose hotkey operates it.
+## Daily revenue
 
-- **Attribution is fixed per payment.** The backend records the user's Main Agent at the time of payment. If the user
-  switches Main Agent, the new agent is credited from the user's next payment.
-- **Epochs close on their own.** A payment or refund is credited to the epoch that contains `block.timestamp`, not to
-  a time supplied by the backend. Writes can only land in the current epoch, so every past epoch is immutable and
-  there is no separate submit or finalize step.
-- **Refunds** are booked in the epoch in which they happen, against the agent the original payment was credited to.
-  Past epochs are never rewritten. Validators score **net revenue = revenue − refunded** summed over their window.
-- **Only active agents in active categories** can receive payments.
+Days follow **UTC midnight** (`genesis` must be one). Revenue follows the agent that actually served the user. Each
+subscription's USD value is spread evenly over its active days, and each day's share goes to the agent or agents
+that served the user that day.
 
-### Data model
+After a day ends, the backend calls `submitDailyRevenue(day, agentIds, usdAmounts, allocationRoot)`:
+- `allocationRoot` is the Merkle root of the per-user allocations behind the totals, so they can be audited.
+- A day can be submitted only once, and only after it has ended.
+- **Total revenue recognized can never exceed total USD paid**, and the contract enforces this.
 
-- **Agent:** `(agentId, hotkey, categoryId, active, registeredAt, metadataURI)`. `hotkey` is the miner's 32-byte
-  sr25519 public key. There is at most one agent per hotkey per category. Validators map hotkey → UID with the
-  metagraph; UIDs are not stored because they can be recycled.
-- **Payment:** `(paymentId, userId, agentId, amount, refunded, paidAt, periodStart, periodEnd, epoch)`.
-- **Per-epoch, per-agent stats:** `revenue`, `refunded`, `payments` and `uniquePayers`.
+## Service status
 
-**Units:** all amounts are **micro-USD** (6 decimals), so `1_000_000` = $1.00.
-**Privacy:** `userId` and `paymentId` are salted hashes. No personal data is stored on-chain.
+The backend calls `heartbeat()` every minute. It calls `setNoAgentsAvailable(true)` while no agent on the whole
+platform is available, and `false` once one is again. `isServiceDown()` is true while that flag is set or no
+heartbeat arrived within `heartbeatTimeout` (180 seconds by default). Validators burn miner emissions while
+`isServiceDown()` is true.
 
-### Roles
+## Roles
 
 | Role | Contract | Holder |
 |---|---|---|
-| `DEFAULT_ADMIN_ROLE` | both | Admin multisig; grants and revokes roles |
-| `OPERATOR_ROLE` | Registry | Platform backend; manages categories and agents |
-| `RECORDER_ROLE` | Ledger | Platform backend; records payments and refunds |
+| `DEFAULT_ADMIN_ROLE` | all | Admin multisig: roles, treasury, prices, oracle, heartbeat timeout |
+| `OPERATOR_ROLE` | Registry | Backend: categories and agents |
+| `PAYMENTS_ROLE` | Ledger | `CounselixTaoPayments` |
+| `RELAYER_ROLE` | Ledger | Backend: relays USDC payments from Base |
+| `RECORDER_ROLE` | Ledger | Backend: daily revenue, heartbeat, no-agents flag |
 
 ## For validators
 
-Read the closed epochs in your scoring window and sum net revenue per hotkey:
-
 ```python
 # web3.py, illustrative
-current = ledger.functions.currentEpoch().call()          # still open; do not score it
-net = defaultdict(int)
-for epoch in range(max(0, current - WINDOW), current):
-    ids, revenues, refunds, payments, payers = ledger.functions.getEpochAttribution(epoch).call()
-    for agent_id, rev, ref in zip(ids, revenues, refunds):
-        hotkey = registry.functions.getAgent(agent_id).call()[0]
-        net[hotkey] += rev - ref
-scores = {hk: max(0, v) for hk, v in net.items()}         # map hotkey -> UID via the metagraph
+if ledger.functions.isServiceDown().call():
+    ...  # burn: all weight to the burn UID
+day = ledger.functions.currentDay().call() - 1          # last closed day
+agent_ids, usd_amounts = ledger.functions.getDailyRevenue(day).call()
+hotkey = registry.functions.getAgent(agent_id).call()[0]
 ```
 
-Make `WINDOW` at least as long as the longest billing period. Otherwise a monthly payment counts in one window and
-then drops out completely in the next. `uniquePayers` lets validators down-weight agents whose revenue comes from
-very few payers, which can be a sign of self-dealing.
+The scoring itself (an EMA of daily revenue, rank-based rewards, USDC checks against Base) lives in
+[counselix-subnet](https://github.com/CounselixAI/counselix-subnet).
 
 ## Development
 
@@ -79,28 +112,33 @@ git clone --recursive https://github.com/CounselixAI/counselix-contracts.git
 forge build
 forge test -vvv
 forge fmt
+BITTENSOR_RPC_URL=https://lite.chain.opentensor.ai forge test --match-test Fork -vv   # oracle on the live pool
 ```
 
 Dependencies are git submodules pinned to OpenZeppelin Contracts `v5.1.0` and forge-std `v1.9.4`.
 
 ## Deployment
 
-The target is the Bittensor EVM (subtensor). Configure the variables in `.env.example`, then run:
+Configure the variables in `.env.example`, then deploy to each chain:
 
 ```bash
 source .env
-forge script script/Deploy.s.sol --rpc-url bittensor_testnet --private-key $PRIVATE_KEY --broadcast
+# Bittensor EVM: Registry, Ledger, oracle, TAO payments
+forge script script/Deploy.s.sol --rpc-url bittensor_mainnet --private-key $PRIVATE_KEY --broadcast
+# Base: USDC payments
+forge script script/DeployBase.s.sol --rpc-url base --private-key $PRIVATE_KEY --broadcast
 ```
 
-RPC endpoints are set in [`foundry.toml`](foundry.toml). Check them against the current Bittensor documentation
-before deploying.
+Run either command without `--broadcast` first to simulate it. RPC endpoints are set in
+[`foundry.toml`](foundry.toml).
 
 ## Trust model
 
-The backend is the only writer, so validators trust it to report payments and Main Agent selections honestly. The
-contracts make that reporting **public, permanent and auditable**: every payment, its agent and every refund are
-on-chain, and closed epochs cannot be changed. Reducing this trust further (for example on-chain payments, or
-user-signed Main Agent selections) is planned work.
+- **Verifiable on-chain:** every payment, where its funds went, its USD value, the TAO price used, daily revenue
+  totals, and that revenue never exceeds payments.
+- **USDC:** relayed by the backend, but each record names its Base transaction, so anyone can check it.
+- **Reported by the backend:** how each day's revenue is split between agents, published with a Merkle root of
+  the per-user allocations for audit, and the service status signals.
 
 ## License
 
